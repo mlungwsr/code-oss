@@ -3,8 +3,8 @@
 A single CloudFormation template that stands up a browser-based
 **Code-OSS / code-server** development environment on an EC2 instance, fronted
 by **Amazon CloudFront** (HTTPS in the browser), and pre-loaded with a common
-developer toolchain: **Docker, kubectl, eksctl, Helm, AWS CLI v2**, plus
-**pyenv + Python 3.14**.
+developer toolchain: **Docker, kubectl, eksctl, Helm, AWS CLI v2**, and
+**Python 3** (`python3`, with a `python` alias).
 
 It gives you a full VS Code-style IDE and terminal in the browser, backed by a
 real Linux machine in your AWS account — useful whenever you want a consistent,
@@ -29,7 +29,7 @@ Browser ─────────────► CloudFront ──────
         (*.cloudfront.net cert)   (origin-facing          Amazon Linux 2023
                                    prefix list only)       Docker / kubectl /
                                                            eksctl / Helm / AWS CLI
-                                                           pyenv + Python 3.14
+                                                           Python 3
 ```
 
 - **CloudFront** terminates TLS for the browser using its default
@@ -59,7 +59,7 @@ Browser ─────────────► CloudFront ──────
 | eksctl | Latest release, with bash auto-completion |
 | Helm | v3, with bash auto-completion |
 | AWS CLI | v2 |
-| pyenv + Python | Latest **3.14.x** (falls back to latest 3.13.x if unavailable), set as `pyenv global` |
+| Python 3 | AL2023 system `python3` (3.9), with a convenient `python` alias |
 
 Bash auto-completion for kubectl, eksctl, helm, and docker is configured for
 both the `coder` user (editor terminal) and `root` (SSM shell).
@@ -103,10 +103,9 @@ aws cloudformation create-stack \
     --region us-west-2
 ```
 
-> **Note:** First creation takes ~10–20 minutes. CloudFront alone needs several
-> minutes to deploy, and the instance then compiles Python from source via
-> pyenv. If you open the URL before bootstrap finishes you may see a CloudFront
-> **502/504** — wait and retry.
+> **Note:** First creation takes ~10–15 minutes, most of it CloudFront
+> propagation. If you open the URL before the instance bootstrap finishes you
+> may see a CloudFront **502/504** — wait and retry.
 
 ---
 
