@@ -1,0 +1,439 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  EC2 instance running Code-OSS (code-server) with Docker, Helm, AWS CLI v2,
+  kubectl, and eksctl, fronted by a CloudFront distribution that terminates
+  HTTPS for the browser and proxies to the instance over HTTP:8080. Access to
+  the instance is via SSM Session Manager (no SSH). The origin security group
+  only allows CloudFront's managed prefix list on port 8080.
+
+###############################################################################
+# Parameters
+###############################################################################
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC in which to launch the instance. Must have a public subnet with internet access.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet (route to IGW, auto-assign public IP enabled) for the instance.
+
+  InstanceType:
+    Type: String
+    Default: t3.large
+    AllowedValues:
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - m5.large
+      - m5.xlarge
+    Description: EC2 instance type. t3.large (2 vCPU / 8 GiB) is a sensible default for Docker + k8s tooling.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: SSM-resolved latest Amazon Linux 2023 AMI. Do not change unless you know what you are doing.
+
+  VolumeSize:
+    Type: Number
+    Default: 50
+    MinValue: 20
+    MaxValue: 500
+    Description: Root EBS volume size in GiB.
+
+###############################################################################
+# Resources
+###############################################################################
+Resources:
+
+  # --- IAM: instance role for SSM Session Manager + SSM Parameter read/write ---
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: WriteCodeServerPassword
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/code-server/password"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-instance-role"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # --- Security group: only CloudFront origin-facing prefix list on 8080 ---
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName} code-server origin SG - CloudFront only on 8080"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: Code-server HTTP from CloudFront edge locations only
+          IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourcePrefixListId: !GetAtt CloudFrontPrefixListLookup.PrefixListId
+      SecurityGroupEgress:
+        - Description: Allow all outbound (package installs, pulling images, AWS APIs)
+          IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-instance-sg"
+
+  # --- Custom resource that looks up the CloudFront origin-facing managed
+  #     prefix list ID (com.amazonaws.global.cloudfront.origin-facing).
+  #     This ID differs per partition, so we resolve it at deploy time. ---
+  PrefixListLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DescribePrefixLists
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeManagedPrefixLists
+                Resource: "*"
+
+  PrefixListLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt PrefixListLookupRole.Arn
+      Code:
+        ZipFile: |
+          # Self-contained custom resource: resolves the CloudFront origin-facing
+          # managed prefix list ID. Sends the CloudFormation response via urllib so
+          # it does NOT depend on the cfnresponse module (which is not available in
+          # the Python managed runtime).
+          import json
+          import urllib.request
+          import boto3
+
+          def send(event, context, status, data, physical_id=None, reason=None):
+              body = {
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch log stream: {context.log_stream_name}",
+                  "PhysicalResourceId": physical_id or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False,
+                  "Data": data,
+              }
+              encoded = json.dumps(body).encode("utf-8")
+              req = urllib.request.Request(
+                  url=event["ResponseURL"],
+                  data=encoded,
+                  method="PUT",
+                  headers={"content-type": "", "content-length": str(len(encoded))},
+              )
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      send(event, context, "SUCCESS", {})
+                      return
+                  ec2 = boto3.client("ec2")
+                  resp = ec2.describe_managed_prefix_lists(
+                      Filters=[{
+                          "Name": "prefix-list-name",
+                          "Values": ["com.amazonaws.global.cloudfront.origin-facing"],
+                      }]
+                  )
+                  pls = resp.get("PrefixLists", [])
+                  if not pls:
+                      send(event, context, "FAILED", {}, reason="CloudFront prefix list not found")
+                      return
+                  pl_id = pls[0]["PrefixListId"]
+                  send(event, context, "SUCCESS", {"PrefixListId": pl_id}, physical_id=pl_id)
+              except Exception as e:
+                  send(event, context, "FAILED", {}, reason=str(e))
+
+  CloudFrontPrefixListLookup:
+    Type: Custom::CloudFrontPrefixList
+    Properties:
+      ServiceToken: !GetAtt PrefixListLookupFunction.Arn
+
+  # --- EC2 instance ---
+  CodeServerInstance:
+    Type: AWS::EC2::Instance
+    # The stack waits for cfn-signal from UserData. If the bootstrap fails or
+    # code-server is not listening within the timeout, stack creation FAILS
+    # (instead of reporting CREATE_COMPLETE while CloudFront returns 504).
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT25M
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref VolumeSize
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-code-oss"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > >(tee /var/log/user-data.log) 2>&1
+
+          CODER_USER=coder
+          CODE_PORT=8080
+
+          # Install cfn-bootstrap (provides cfn-signal). NOT preinstalled on AL2023.
+          # NOTE: do NOT install "curl" on AL2023 - the base image ships
+          # curl-minimal which provides the curl command and conflicts with
+          # the full curl package. --allowerasing guards against similar cases.
+          dnf install -y --allowerasing git tar gzip unzip shadow-utils docker aws-cfn-bootstrap bash-completion
+
+          # From here on, any error (or a premature exit) signals FAILURE to
+          # CloudFormation so the stack rolls back instead of hanging/looking healthy.
+          trap '/opt/aws/bin/cfn-signal --exit-code 1 \
+                  --stack ${AWS::StackName} \
+                  --resource CodeServerInstance \
+                  --region ${AWS::Region} || true' ERR
+
+          # --- Docker ---
+          systemctl enable --now docker
+
+          # --- User to run code-server ---
+          id -u "$CODER_USER" &>/dev/null || useradd -m -s /bin/bash "$CODER_USER"
+          usermod -aG docker "$CODER_USER"
+
+          # --- AWS CLI v2 ---
+          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+          cd /tmp && unzip -q awscliv2.zip && ./aws/install --update
+          cd /
+
+          # --- kubectl (latest stable) ---
+          KUBECTL_VER=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+          curl -fsSL "https://dl.k8s.io/release/${!KUBECTL_VER}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
+          chmod +x /usr/local/bin/kubectl
+
+          # kubectl bash auto-completion (+ "k" alias) for both the coder user
+          # (code-server terminal) and root (SSM shell).
+          for rc in "/home/$CODER_USER/.bashrc" /root/.bashrc; do
+            echo 'source <(kubectl completion bash)' >> "$rc"
+            echo 'alias k=kubectl' >> "$rc"
+            echo 'complete -o default -F __start_kubectl k' >> "$rc"
+          done
+          chown "$CODER_USER:$CODER_USER" "/home/$CODER_USER/.bashrc"
+
+          # --- eksctl ---
+          curl -fsSL "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz" -o /tmp/eksctl.tar.gz
+          tar -xzf /tmp/eksctl.tar.gz -C /tmp
+          mv /tmp/eksctl /usr/local/bin/eksctl
+          chmod +x /usr/local/bin/eksctl
+
+          # eksctl bash auto-completion
+          for rc in "/home/$CODER_USER/.bashrc" /root/.bashrc; do
+            echo 'source <(eksctl completion bash)' >> "$rc"
+          done
+
+          # --- Helm ---
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+          # helm bash auto-completion
+          for rc in "/home/$CODER_USER/.bashrc" /root/.bashrc; do
+            echo 'source <(helm completion bash)' >> "$rc"
+          done
+
+          # docker bash auto-completion (fetch the official completion script)
+          curl -fsSL https://raw.githubusercontent.com/docker/cli/master/contrib/completion/bash/docker \
+            -o /etc/bash_completion.d/docker || true
+          for rc in "/home/$CODER_USER/.bashrc" /root/.bashrc; do
+            echo '[ -f /etc/bash_completion.d/docker ] && source /etc/bash_completion.d/docker' >> "$rc"
+          done
+
+          # Re-assert ownership of coder's .bashrc after the completion appends.
+          chown "$CODER_USER:$CODER_USER" "/home/$CODER_USER/.bashrc"
+
+          # --- pyenv + Python 3.14 (built from source for the coder user) ---
+          # Build toolchain and headers required to compile CPython.
+          dnf install -y --allowerasing gcc make patch zlib-devel bzip2 bzip2-devel \
+            readline-devel sqlite sqlite-devel openssl-devel tk-devel libffi-devel \
+            xz xz-devel libuuid-devel gdbm-devel ncurses-devel
+
+          # Install pyenv and build Python as the coder user. Prefer the latest
+          # 3.14.x; if unavailable at deploy time, fall back to the latest 3.13.x.
+          su - "$CODER_USER" -c '
+            set -eux
+            export PYENV_ROOT="$HOME/.pyenv"
+            if [ ! -d "$PYENV_ROOT" ]; then
+              curl -fsSL https://pyenv.run | bash
+            fi
+
+            # pyenv shell init for both interactive (.bashrc) and login (.bash_profile) shells.
+            for rc in "$HOME/.bashrc" "$HOME/.bash_profile"; do
+              touch "$rc"
+              if ! grep -q "PYENV_ROOT" "$rc"; then
+                {
+                  echo "export PYENV_ROOT=\"\$HOME/.pyenv\""
+                  echo "command -v pyenv >/dev/null || export PATH=\"\$PYENV_ROOT/bin:\$PATH\""
+                  echo "eval \"\$(pyenv init - bash)\""
+                } >> "$rc"
+              fi
+            done
+
+            export PATH="$PYENV_ROOT/bin:$PATH"
+            eval "$(pyenv init - bash)"
+
+            # Resolve the newest available 3.14.x, else newest 3.13.x.
+            PYVER=$(pyenv install --list | tr -d " " | grep -E "^3\.14\.[0-9]+$" | tail -1 || true)
+            if [ -z "$PYVER" ]; then
+              PYVER=$(pyenv install --list | tr -d " " | grep -E "^3\.13\.[0-9]+$" | tail -1)
+              echo "WARNING: no 3.14.x available via pyenv; falling back to $PYVER"
+            fi
+
+            pyenv install -s "$PYVER"
+            pyenv global "$PYVER"
+            pyenv rehash
+            echo "pyenv installed Python $PYVER as global; $(python --version 2>&1)"
+          '
+
+
+          # --- code-server (Code-OSS in the browser) ---
+          export HOME=/root
+          curl -fsSL https://code-server.dev/install.sh | sh
+
+          # Generate password and store in SSM SecureString
+          CODE_PW=$(openssl rand -hex 16)
+          aws ssm put-parameter \
+            --name "/${AWS::StackName}/code-server/password" \
+            --type SecureString \
+            --value "$CODE_PW" \
+            --overwrite \
+            --region "${AWS::Region}"
+
+          # code-server config for the coder user
+          install -d -o "$CODER_USER" -g "$CODER_USER" "/home/$CODER_USER/.config/code-server"
+          cat > "/home/$CODER_USER/.config/code-server/config.yaml" <<EOF
+          bind-addr: 0.0.0.0:${!CODE_PORT}
+          auth: password
+          password: $CODE_PW
+          cert: false
+          EOF
+          chown -R "$CODER_USER:$CODER_USER" "/home/$CODER_USER/.config"
+
+          # Enable the bundled systemd service for the coder user
+          systemctl enable --now "code-server@$CODER_USER"
+
+          # --- Readiness gate: only signal SUCCESS once code-server actually
+          #     answers on 8080 (what CloudFront depends on). ---
+          ready=0
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null "http://localhost:${!CODE_PORT}/healthz" \
+               || curl -fsS -o /dev/null "http://localhost:${!CODE_PORT}/"; then
+              ready=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "code-server did not become ready on port ${!CODE_PORT}" >&2
+            exit 1
+          fi
+
+          echo "code-oss bootstrap complete"
+
+          # Signal SUCCESS to CloudFormation (clear the ERR trap first).
+          trap - ERR
+          /opt/aws/bin/cfn-signal --exit-code 0 \
+            --stack ${AWS::StackName} \
+            --resource CodeServerInstance \
+            --region ${AWS::Region}
+
+  # --- CloudFront distribution ---
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName} Code-OSS"
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Origins:
+          - Id: code-server-origin
+            DomainName: !GetAtt CodeServerInstance.PublicDnsName
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: 8080
+              OriginSSLProtocols:
+                - TLSv1.2
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: code-server-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: false
+          # AWS managed policies:
+          #   CachingDisabled               4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          #   AllViewer (origin request)    216adef6-5c7f-47e4-b989-5492eafa07d3
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+###############################################################################
+# Outputs
+###############################################################################
+Outputs:
+  CodeOssUrl:
+    Description: Open this in your browser to reach Code-OSS (HTTPS via CloudFront).
+    Value: !Sub "https://${Distribution.DomainName}"
+
+  GetPasswordCommand:
+    Description: Run this to retrieve the auto-generated code-server login password.
+    Value: !Sub "aws ssm get-parameter --name /${AWS::StackName}/code-server/password --with-decryption --query Parameter.Value --output text --region ${AWS::Region}"
+
+  SessionManagerCommand:
+    Description: Open a shell on the instance (no SSH needed).
+    Value: !Sub "aws ssm start-session --target ${CodeServerInstance} --region ${AWS::Region}"
+
+  InstanceId:
+    Description: EC2 instance ID.
+    Value: !Ref CodeServerInstance
