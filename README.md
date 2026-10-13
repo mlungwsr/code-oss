@@ -1,14 +1,23 @@
-# Code-OSS on EC2 behind CloudFront (for Amazon EKS classes)
+# Code-OSS on EC2 behind CloudFront
 
 A single CloudFormation template that stands up a browser-based
 **Code-OSS / code-server** development environment on an EC2 instance, fronted
-by **Amazon CloudFront** (HTTPS in the browser), and pre-loaded with the common
-Kubernetes toolchain: **Docker, kubectl, eksctl, Helm, AWS CLI v2**, plus
+by **Amazon CloudFront** (HTTPS in the browser), and pre-loaded with a common
+developer toolchain: **Docker, kubectl, eksctl, Helm, AWS CLI v2**, plus
 **pyenv + Python 3.14**.
 
-It's designed as a ready-to-use lab box for instructor-led Amazon EKS training:
-students open a URL, log in with a generated password, and get a full terminal
-with everything installed — no local setup required.
+It gives you a full VS Code-style IDE and terminal in the browser, backed by a
+real Linux machine in your AWS account — useful whenever you want a consistent,
+disposable cloud dev environment you can reach from any browser without
+installing anything locally. Typical uses:
+
+- A cloud workstation you can open from a laptop, tablet, or borrowed machine.
+- A throwaway sandbox for experimenting with Docker, Kubernetes, or the AWS CLI.
+- A shared, reproducible environment for workshops, demos, or onboarding.
+- A pre-configured box so you don't have to set up tooling on every new machine.
+
+Deploy the stack, open the URL, log in with a generated password, and you have
+a full terminal with everything installed — no local setup required.
 
 ---
 
@@ -197,10 +206,12 @@ each deploy, so deleting and recreating is safe.
 - Browser traffic is HTTPS (CloudFront default cert); the CloudFront→origin hop
   is HTTP over the private path allowed by the prefix list.
 - The login password is a generated SecureString in SSM Parameter Store.
-- This is a **training/lab** setup. Before using it for anything beyond a class,
-  consider: a custom domain + ACM certificate instead of the default
-  CloudFront cert, restricting who can read the SSM password parameter, and
-  shortening the instance lifetime.
+- This is a convenient **single-user dev environment** with sensible defaults.
+  For longer-lived or production-adjacent use, consider: a custom domain + ACM
+  certificate instead of the default CloudFront cert, restricting who can read
+  the SSM password parameter, running the instance in a private subnet with a
+  CloudFront VPC origin, and stopping or deleting the stack when idle to save
+  cost.
 
 ---
 
